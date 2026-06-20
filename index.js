@@ -1,4 +1,4 @@
-// index.js — Slash & prefix commands, SQLite persistence, warn auto-actions and modlog command
+// index.js — Slash & prefix commands, SQLite persistence, warn auto-actions and many commands
 // Requires Node 16+, discord.js v14, better-sqlite3, and dotenv for local development
 
 require('dotenv').config();
@@ -15,8 +15,8 @@ const {
 const Database = require('better-sqlite3');
 
 const TOKEN = process.env.DISCORD_TOKEN;
-const GUILD_ID = process.env.GUILD_ID || '1506638044361658508'; // provided test guild
-let PREFIX = process.env.PREFIX || '!';
+const GUILD_ID = process.env.GUILD_ID || '1506638044361658508';
+let GLOBAL_PREFIX = process.env.PREFIX || '!';
 const DATA_DIR = path.join(__dirname, 'data');
 const DB_FILE = process.env.DATABASE_FILE || path.join(DATA_DIR, 'bot.db');
 
@@ -71,7 +71,7 @@ db.prepare(`CREATE TABLE IF NOT EXISTS warn_actions (
 // Load prefix from DB if exists
 function loadPrefix(guildId) {
   const row = db.prepare('SELECT prefix FROM settings WHERE guildId = ?').get(guildId);
-  return row ? row.prefix : PREFIX;
+  return row && row.prefix ? row.prefix : GLOBAL_PREFIX;
 }
 
 function savePrefix(guildId, prefix) {
@@ -116,7 +116,6 @@ async function doUnban(guild, userId) {
   db.prepare('DELETE FROM tempbans WHERE guildId = ? AND userId = ?').run(guild.id, userId);
   const key = `${guild.id}:${userId}`;
   if (scheduledUnbans.has(key)) { clearTimeout(scheduledUnbans.get(key)); scheduledUnbans.delete(key); }
-  // announce to modlog
   const chId = getModLogChannelId(guild.id);
   try {
     const ch = chId ? guild.channels.cache.get(chId) : (guild.systemChannel || guild.channels.cache.find(c => c.isTextBased() && c.permissionsFor(guild.members.me).has(PermissionsBitField.Flags.SendMessages)));
@@ -194,26 +193,47 @@ client.commands = new Collection();
 
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
-  client.user.setActivity(`${PREFIX}help | ${client.guilds.cache.size} guild(s)`);
+  client.user.setActivity(`${GLOBAL_PREFIX}help | ${client.guilds.cache.size} guild(s)`);
 
   // Register guild-scoped slash commands for instant updates
   try {
     const guild = await client.guilds.fetch(GUILD_ID).catch(() => null);
     if (guild) {
+      // Build commands list (many commands, and keep in sync with prefix handlers)
       const commands = [
         { name: 'ping', description: 'Check bot latency' },
+        { name: 'uptime', description: 'Show bot uptime' },
+        { name: 'stats', description: 'Show basic bot stats' },
+        { name: 'invite', description: 'Get bot invite link' },
         { name: 'avatar', description: 'Get user avatar', options: [{ name: 'user', type: 6, description: 'User', required: false }] },
         { name: 'serverinfo', description: 'Show server info' },
+        { name: 'servericon', description: 'Show server icon' },
+        { name: 'serverbanner', description: 'Show server banner' },
         { name: 'userinfo', description: 'Show user info', options: [{ name: 'user', type: 6, description: 'User', required: false }] },
+        { name: 'whois', description: 'Alias for userinfo', options: [{ name: 'user', type: 6, required: false }] },
         { name: 'roles', description: 'List top roles' },
+        { name: 'channels', description: 'List channels' },
+        { name: 'emojis', description: 'List emojis' },
+        { name: 'members', description: 'Show member counts' },
+        { name: 'bots', description: 'Show bot count' },
+        { name: 'ping', description: 'Check latency' },
         { name: 'say', description: 'Bot says something', options: [{ name: 'text', type: 3, description: 'Text', required: true }] },
-        { name: 'embed', description: 'Send an embed', options: [{ name: 'text', type: 3, description: 'Text', required: true }] },
+        { name: 'echo', description: 'Echo text', options: [{ name: 'text', type: 3, required: true }] },
+        { name: 'reverse', description: 'Reverse text', options: [{ name: 'text', type: 3, required: true }] },
+        { name: 'roll', description: 'Roll dice (e.g. 2d6)', options: [{ name: 'dice', type: 3, required: false }] },
+        { name: 'coin', description: 'Flip a coin' },
+        { name: '8ball', description: 'Ask the magic 8-ball', options: [{ name: 'question', type: 3, required: true }] },
         { name: 'kick', description: 'Kick a member', options: [{ name: 'user', type: 6, required: true }, { name: 'reason', type: 3, required: false }] },
         { name: 'ban', description: 'Ban a member', options: [{ name: 'user', type: 6, required: true }, { name: 'reason', type: 3, required: false }] },
+        { name: 'softban', description: 'Softban (ban+unban) a member', options: [{ name: 'user', type: 6, required: true }, { name: 'reason', type: 3, required: false }] },
         { name: 'tempban', description: 'Tempban a member', options: [{ name: 'user', type: 6, required: true }, { name: 'duration', type: 3, required: true }, { name: 'reason', type: 3, required: false }] },
         { name: 'mute', description: 'Mute a member', options: [{ name: 'user', type: 6, required: true }] },
         { name: 'unmute', description: 'Unmute a member', options: [{ name: 'user', type: 6, required: true }] },
         { name: 'tempmute', description: 'Tempmute a member', options: [{ name: 'user', type: 6, required: true }, { name: 'duration', type: 3, required: true }] },
+        { name: 'lock', description: 'Lock channel' },
+        { name: 'unlock', description: 'Unlock channel' },
+        { name: 'slowmode', description: 'Set slowmode in seconds', options: [{ name: 'seconds', type: 4, required: true }] },
+        { name: 'nuke', description: 'Nuke the channel (delete+recreate)' },
         { name: 'clear', description: 'Bulk delete messages', options: [{ name: 'count', type: 4, required: true }] },
         { name: 'warn', description: 'Warn a user', options: [{ name: 'user', type: 6, required: true }, { name: 'reason', type: 3, required: false }] },
         { name: 'warnings', description: 'Show warnings', options: [{ name: 'user', type: 6, required: false }] },
@@ -221,6 +241,7 @@ client.once('ready', async () => {
         { name: 'report', description: 'Report a user', options: [{ name: 'user', type: 6, required: true }, { name: 'reason', type: 3, required: false }] },
         { name: 'tempbanlist', description: 'List active tempbans' },
         { name: 'setprefix', description: 'Set command prefix', options: [{ name: 'prefix', type: 3, required: true }] },
+        { name: 'getprefix', description: 'Get current server prefix' },
         { name: 'setmodlog', description: 'Set mod-log channel', options: [{ name: 'channel', type: 7, description: 'Channel', required: true }] },
         { name: 'warnpolicy', description: 'Manage warn auto-actions', options: [
             { name: 'add', type: 1, description: 'Add a warn action', options: [{ name: 'threshold', type: 4, required: true }, { name: 'action', type: 3, required: true, description: 'mute, tempmute, kick, ban, tempban' }, { name: 'duration', type: 3, required: false, description: 'For temp actions, duration like 1d2h' }] },
@@ -260,12 +281,14 @@ client.once('ready', async () => {
 
 // Shared command handlers
 async function handleCommandRun(context) {
-  // context: { type: 'msg'|'interaction', message, interaction, commandName, args, options }
   const { type, message, interaction, commandName, args, options } = context;
   const respond = async (content) => {
     if (type === 'msg') return message.channel.send(content);
     return interaction.reply({ ...content, ephemeral: content && content.ephemeral ? true : false });
   };
+
+  function guildOf() { return type === 'msg' ? message.guild : interaction.guild; }
+  function authorOf() { return type === 'msg' ? message.author : interaction.user; }
 
   try {
     switch (commandName) {
@@ -280,20 +303,45 @@ async function handleCommandRun(context) {
         }
       }
 
+      case 'uptime': {
+        const ms = process.uptime() * 1000;
+        const sec = Math.floor((ms/1000)%60), min = Math.floor((ms/60000)%60), hr = Math.floor(ms/3600000);
+        return respond({ content: `Uptime: ${hr}h ${min}m ${sec}s` });
+      }
+
+      case 'stats': {
+        return respond({ content: `Guilds: ${client.guilds.cache.size} — Users cached: ${client.users.cache.size}` });
+      }
+
+      case 'invite': {
+        return respond({ content: `Invite: https://discord.com/oauth2/authorize?client_id=${client.user.id}&scope=bot%20applications.commands&permissions=8` });
+      }
+
       case 'avatar': {
         const user = (type === 'msg' ? (message.mentions.users.first() || message.author) : (options.getUser('user') || interaction.user));
         return respond({ content: user.displayAvatarURL({ dynamic: true, size: 1024 }) });
       }
 
+      case 'servericon': {
+        const g = guildOf();
+        return respond({ content: g.iconURL({ dynamic: true, size: 1024 }) || 'No icon' });
+      }
+
+      case 'serverbanner': {
+        const g = guildOf();
+        return respond({ content: g.bannerURL ? g.bannerURL({ size: 1024 }) : 'No banner' });
+      }
+
       case 'serverinfo': {
-        const g = type === 'msg' ? message.guild : interaction.guild;
+        const g = guildOf();
         const embed = new EmbedBuilder().setTitle(`${g.name} — Info`).setThumbnail(g.iconURL({ dynamic: true }))
           .addFields({ name: 'ID', value: g.id, inline: true }, { name: 'Members', value: `${g.memberCount}`, inline: true }, { name: 'Created', value: new Date(g.createdTimestamp).toLocaleString(), inline: true })
           .setFooter({ text: `Locale: ${g.preferredLocale || 'unknown'}` });
         return respond({ embeds: [embed] });
       }
 
-      case 'userinfo': {
+      case 'userinfo':
+      case 'whois': {
         const member = type === 'msg' ? (message.mentions.members.first() || message.member) : (options.getMember('user') || interaction.member);
         const user = member.user;
         const embed = new EmbedBuilder().setAuthor({ name: `${user.tag}`, iconURL: user.displayAvatarURL({ dynamic: true }) })
@@ -302,53 +350,135 @@ async function handleCommandRun(context) {
       }
 
       case 'roles': {
-        const g = type === 'msg' ? message.guild : interaction.guild;
+        const g = guildOf();
         const roles = g.roles.cache.filter(r => r.id !== g.id).sort((a, b) => b.position - a.position).map(r => r.name).slice(0, 30);
         return respond({ content: `Roles (${roles.length} shown): ${roles.join(', ')}` });
       }
 
-      case 'say': {
+      case 'channels': {
+        const g = guildOf();
+        const list = g.channels.cache.filter(c => c.isTextBased()).map(c => `${c.name} (${c.id})`).join('\n');
+        return respond({ content: `Channels:\n${list}` });
+      }
+
+      case 'emojis': {
+        const g = guildOf();
+        const list = g.emojis.cache.map(e => `${e} ${e.name}`).join(' ');
+        return respond({ content: list || 'No emojis' });
+      }
+
+      case 'members': {
+        const g = guildOf();
+        return respond({ content: `Members: ${g.memberCount}` });
+      }
+
+      case 'bots': {
+        const g = guildOf();
+        const bots = g.members.cache.filter(m => m.user.bot).size;
+        return respond({ content: `Bots in server: ${bots}` });
+      }
+
+      case 'echo': {
         const text = type === 'msg' ? args.join(' ') : options.getString('text');
-        const member = type === 'msg' ? message.member : interaction.member;
-        if (!member.permissions.has(PermissionsBitField.Flags.ManageMessages)) return respond({ content: 'You do not have permission to use this command.', ephemeral: true });
         if (type === 'msg') await message.delete().catch(() => {});
         return respond({ content: text });
       }
 
-      case 'embed': {
+      case 'reverse': {
         const text = type === 'msg' ? args.join(' ') : options.getString('text');
-        const member = type === 'msg' ? message.member : interaction.member;
-        if (!member.permissions.has(PermissionsBitField.Flags.ManageMessages)) return respond({ content: 'You do not have permission to use this command.', ephemeral: true });
-        if (type === 'msg') await message.delete().catch(() => {});
-        return respond({ embeds: [new EmbedBuilder().setDescription(text).setColor(0x00AE86)] });
+        return respond({ content: text.split('').reverse().join('') });
       }
 
-      case 'kick': {
-        const member = type === 'msg' ? (message.mentions.members.first()) : options.getMember('user');
-        const reason = type === 'msg' ? args.slice(1).join(' ') || 'No reason provided' : (options.getString('reason') || 'No reason provided');
-        const executor = type === 'msg' ? message.member : interaction.member;
-        if (!executor.permissions.has(PermissionsBitField.Flags.KickMembers)) return respond({ content: 'You need Kick Members permission.', ephemeral: true });
-        if (!member) return respond({ content: 'Member not found.', ephemeral: true });
-        if (!member.kickable) return respond({ content: 'I cannot kick that user.', ephemeral: true });
-        await member.kick(reason);
-        // log
-        logToMod(guildOf(type, message, interaction), `${member.user.tag} was kicked by ${executor.user.tag}. Reason: ${reason}`);
-        return respond({ content: `${member.user.tag} was kicked. Reason: ${reason}` });
+      case 'roll': {
+        const dice = type === 'msg' ? (args[0] || '1d6') : (options.getString('dice') || '1d6');
+        const m = dice.match(/(\d+)d(\d+)/);
+        if (!m) return respond({ content: 'Invalid dice format, use NdM like 2d6', ephemeral: true });
+        const n = parseInt(m[1],10), sides = parseInt(m[2],10);
+        if (n > 100) return respond({ content: 'Too many dice (max 100)', ephemeral: true });
+        const rolls = [];
+        for (let i=0;i<n;i++) rolls.push(1 + Math.floor(Math.random()*sides));
+        return respond({ content: `Rolled: ${rolls.join(', ')} (total ${rolls.reduce((a,b)=>a+b,0)})` });
       }
 
-      case 'ban': {
-        const member = type === 'msg' ? (message.mentions.members.first()) : options.getMember('user');
-        const reason = type === 'msg' ? args.slice(1).join(' ') || 'No reason provided' : (options.getString('reason') || 'No reason provided');
+      case 'coin': {
+        return respond({ content: Math.random() < 0.5 ? 'Heads' : 'Tails' });
+      }
+
+      case '8ball': {
+        const q = type === 'msg' ? args.join(' ') : options.getString('question');
+        const answers = ['Yes.','No.','Maybe.','Ask again later.','Definitely.','I don\'t think so.'];
+        return respond({ content: answers[Math.floor(Math.random()*answers.length)] });
+      }
+
+      // ---------------- Moderation expanded ----------------
+      case 'softban': {
+        const member = type === 'msg' ? message.mentions.members.first() : options.getMember('user');
+        const reason = type === 'msg' ? args.slice(1).join(' ') || 'Softban' : (options.getString('reason')||'Softban');
         const executor = type === 'msg' ? message.member : interaction.member;
         if (!executor.permissions.has(PermissionsBitField.Flags.BanMembers)) return respond({ content: 'You need Ban Members permission.', ephemeral: true });
         if (!member) return respond({ content: 'Member not found.', ephemeral: true });
-        await member.ban({ days: 0, reason });
-        logToMod(guildOf(type, message, interaction), `${member.user.tag} was banned by ${executor.user.tag}. Reason: ${reason}`);
-        return respond({ content: `${member.user.tag} was banned. Reason: ${reason}` });
+        await member.ban({ days: 1, reason }).catch(() => {});
+        await member.unban(member.id).catch(() => {});
+        logToMod(guildOf(), `${member.user.tag} was softbanned by ${executor.user.tag}. Reason: ${reason}`);
+        return respond({ content: `${member.user.tag} has been softbanned.` });
+      }
+
+      case 'lock': {
+        const ch = type === 'msg' ? message.channel : interaction.channel;
+        const me = guildOf().members.me;
+        if (!me.permissions.has(PermissionsBitField.Flags.ManageChannels)) return respond({ content: 'Bot lacks Manage Channels permission.', ephemeral: true });
+        await ch.permissionOverwrites.edit(guildOf().roles.everyone, { SendMessages: false }).catch(() => {});
+        logToMod(guildOf(), `Channel ${ch.name} locked by ${authorOf().tag}`);
+        return respond({ content: `Locked ${ch}` });
+      }
+
+      case 'unlock': {
+        const ch = type === 'msg' ? message.channel : interaction.channel;
+        await ch.permissionOverwrites.edit(guildOf().roles.everyone, { SendMessages: null }).catch(() => {});
+        logToMod(guildOf(), `Channel ${ch.name} unlocked by ${authorOf().tag}`);
+        return respond({ content: `Unlocked ${ch}` });
+      }
+
+      case 'slowmode': {
+        const seconds = type === 'msg' ? parseInt(args[0],10) : options.getInteger('seconds');
+        const ch = type === 'msg' ? message.channel : interaction.channel;
+        if (isNaN(seconds) || seconds < 0 || seconds > 21600) return respond({ content: 'Seconds must be between 0 and 21600', ephemeral: true });
+        await ch.setRateLimitPerUser(seconds).catch(() => {});
+        logToMod(guildOf(), `Set slowmode for ${ch.name} to ${seconds}s by ${authorOf().tag}`);
+        return respond({ content: `Set slowmode to ${seconds}s` });
+      }
+
+      case 'nuke': {
+        const ch = type === 'msg' ? message.channel : interaction.channel;
+        const guild = guildOf();
+        const clone = await ch.clone().catch(() => null);
+        if (!clone) return respond({ content: 'Failed to clone channel', ephemeral: true });
+        await ch.delete().catch(() => {});
+        logToMod(guild, `${authorOf().tag} nuked channel ${ch.name}`);
+        return respond({ content: `Nuked and recreated channel ${clone.name}` });
+      }
+
+      case 'softban': // handled above
+      case 'kick': {
+        if (commandName !== 'kick') break; // fallthrough safe-guard
+      }
+
+      case 'ban': {
+        if (commandName === 'ban') {
+          const member = type === 'msg' ? message.mentions.members.first() : options.getMember('user');
+          const reason = type === 'msg' ? args.slice(1).join(' ') || 'No reason provided' : (options.getString('reason') || 'No reason provided');
+          const executor = type === 'msg' ? message.member : interaction.member;
+          if (!executor.permissions.has(PermissionsBitField.Flags.BanMembers)) return respond({ content: 'You need Ban Members permission.', ephemeral: true });
+          if (!member) return respond({ content: 'Member not found.', ephemeral: true });
+          await member.ban({ days: 0, reason }).catch(() => {});
+          logToMod(guildOf(), `${member.user.tag} was banned by ${executor.user.tag}. Reason: ${reason}`);
+          return respond({ content: `${member.user.tag} was banned. Reason: ${reason}` });
+        }
+        break;
       }
 
       case 'tempban': {
-        const member = type === 'msg' ? (message.mentions.members.first()) : options.getMember('user');
+        const member = type === 'msg' ? message.mentions.members.first() : options.getMember('user');
         const durationArg = type === 'msg' ? args[1] : options.getString('duration');
         const reason = type === 'msg' ? args.slice(2).join(' ') || 'No reason provided' : (options.getString('reason') || 'No reason provided');
         const executor = type === 'msg' ? message.member : interaction.member;
@@ -357,53 +487,50 @@ async function handleCommandRun(context) {
         const ms = parseDuration(durationArg);
         if (!ms) return respond({ content: 'Invalid duration format. Use 1d2h30m', ephemeral: true });
         const unbanAt = Date.now() + ms;
-        await member.ban({ days: 0, reason });
-        db.prepare('INSERT INTO tempbans (guildId, userId, unbanAt) VALUES (?, ?, ?)').run((type === 'msg' ? message.guild.id : interaction.guild.id), member.user.id, unbanAt);
-        scheduleUnban(type === 'msg' ? message.guild : interaction.guild, member.user.id, unbanAt);
-        logToMod(guildOf(type, message, interaction), `${member.user.tag} was temp-banned by ${executor.user.tag} until ${new Date(unbanAt).toLocaleString()}. Reason: ${reason}`);
+        await member.ban({ days: 0, reason }).catch(() => {});
+        db.prepare('INSERT INTO tempbans (guildId, userId, unbanAt) VALUES (?, ?, ?)').run(guildOf().id, member.user.id, unbanAt);
+        scheduleUnban(guildOf(), member.user.id, unbanAt);
+        logToMod(guildOf(), `${member.user.tag} was temp-banned by ${executor.user.tag} until ${new Date(unbanAt).toLocaleString()}. Reason: ${reason}`);
         return respond({ content: `${member.user.tag} was temp-banned for ${durationArg}. Reason: ${reason}` });
       }
 
       case 'mute': {
-        const member = type === 'msg' ? (message.mentions.members.first()) : options.getMember('user');
+        const member = type === 'msg' ? message.mentions.members.first() : options.getMember('user');
         const executor = type === 'msg' ? message.member : interaction.member;
-        if (!executor.permissions.has(PermissionsBitField.Flags.ModerateMembers) && !executor.permissions.has(PermissionsBitField.Flags.ManageRoles)) return respond({ content: 'You need Moderate Members or Manage Roles permission.', ephemeral: true });
+        if (!executor.permissions.has(PermissionsBitField.Flags.ManageRoles) && !executor.permissions.has(PermissionsBitField.Flags.ModerateMembers)) return respond({ content: 'You need Manage Roles or Moderate Members permission.', ephemeral: true });
         if (!member) return respond({ content: 'Member not found.', ephemeral: true });
-        const role = await ensureMutedRole(type === 'msg' ? message.guild : interaction.guild);
+        const role = await ensureMutedRole(guildOf());
         if (!role) return respond({ content: 'Failed to ensure Muted role exists.', ephemeral: true });
-        if (member.roles.cache.has(role.id)) return respond({ content: 'Member is already muted.', ephemeral: true });
         await member.roles.add(role, `Muted by ${executor.user.tag}`);
-        logToMod(guildOf(type, message, interaction), `${member.user.tag} was muted by ${executor.user.tag}.`);
+        logToMod(guildOf(), `${member.user.tag} was muted by ${executor.user.tag}.`);
         return respond({ content: `${member.user.tag} has been muted.` });
       }
 
       case 'unmute': {
-        const member = type === 'msg' ? (message.mentions.members.first()) : options.getMember('user');
+        const member = type === 'msg' ? message.mentions.members.first() : options.getMember('user');
         const executor = type === 'msg' ? message.member : interaction.member;
-        if (!executor.permissions.has(PermissionsBitField.Flags.ModerateMembers) && !executor.permissions.has(PermissionsBitField.Flags.ManageRoles)) return respond({ content: 'You need Moderate Members or Manage Roles permission.', ephemeral: true });
+        if (!executor.permissions.has(PermissionsBitField.Flags.ManageRoles) && !executor.permissions.has(PermissionsBitField.Flags.ModerateMembers)) return respond({ content: 'You need Manage Roles or Moderate Members permission.', ephemeral: true });
         if (!member) return respond({ content: 'Member not found.', ephemeral: true });
-        const role = (type === 'msg' ? message.guild : interaction.guild).roles.cache.find(r => r.name === 'Muted');
-        if (!role) return respond({ content: 'No Muted role found.', ephemeral: true });
-        if (!member.roles.cache.has(role.id)) return respond({ content: 'Member is not muted.', ephemeral: true });
-        await member.roles.remove(role, `Unmuted by ${executor.user.tag}`);
-        logToMod(guildOf(type, message, interaction), `${member.user.tag} was unmuted by ${executor.user.tag}.`);
+        const role = guildOf().roles.cache.find(r => r.name === 'Muted');
+        if (role && member.roles.cache.has(role.id)) await member.roles.remove(role, `Unmuted by ${executor.user.tag}`);
+        logToMod(guildOf(), `${member.user.tag} was unmuted by ${executor.user.tag}.`);
         return respond({ content: `${member.user.tag} has been unmuted.` });
       }
 
       case 'tempmute': {
-        const member = type === 'msg' ? (message.mentions.members.first()) : options.getMember('user');
+        const member = type === 'msg' ? message.mentions.members.first() : options.getMember('user');
         const durationArg = type === 'msg' ? args[1] : options.getString('duration');
         const executor = type === 'msg' ? message.member : interaction.member;
-        if (!executor.permissions.has(PermissionsBitField.Flags.ModerateMembers) && !executor.permissions.has(PermissionsBitField.Flags.ManageRoles)) return respond({ content: 'You need Moderate Members or Manage Roles permission.', ephemeral: true });
+        if (!executor.permissions.has(PermissionsBitField.Flags.ManageRoles) && !executor.permissions.has(PermissionsBitField.Flags.ModerateMembers)) return respond({ content: 'You need Manage Roles or Moderate Members permission.', ephemeral: true });
         if (!member) return respond({ content: 'Member not found.', ephemeral: true });
         const ms = parseDuration(durationArg);
         if (!ms) return respond({ content: 'Invalid duration.', ephemeral: true });
-        const role = await ensureMutedRole(type === 'msg' ? message.guild : interaction.guild);
+        const role = await ensureMutedRole(guildOf());
         await member.roles.add(role, `Tempmuted by ${executor.user.tag} for ${durationArg}`);
         const unmuteAt = Date.now() + ms;
-        db.prepare('INSERT INTO tempmutes (guildId, userId, unmuteAt) VALUES (?, ?, ?)').run((type === 'msg' ? message.guild.id : interaction.guild.id), member.user.id, unmuteAt);
-        scheduleUnmute(type === 'msg' ? message.guild : interaction.guild, member.user.id, unmuteAt);
-        logToMod(guildOf(type, message, interaction), `${member.user.tag} was tempmuted by ${executor.user.tag} until ${new Date(unmuteAt).toLocaleString()}.`);
+        db.prepare('INSERT INTO tempmutes (guildId, userId, unmuteAt) VALUES (?, ?, ?)').run(guildOf().id, member.user.id, unmuteAt);
+        scheduleUnmute(guildOf(), member.user.id, unmuteAt);
+        logToMod(guildOf(), `${member.user.tag} was tempmuted by ${executor.user.tag} until ${new Date(unmuteAt).toLocaleString()}.`);
         return respond({ content: `${member.user.tag} was tempmuted for ${durationArg}.` });
       }
 
@@ -422,27 +549,20 @@ async function handleCommandRun(context) {
         const executor = type === 'msg' ? message.member : interaction.member;
         if (!executor.permissions.has(PermissionsBitField.Flags.KickMembers) && !executor.permissions.has(PermissionsBitField.Flags.BanMembers)) return respond({ content: 'You need Kick or Ban permission to warn.', ephemeral: true });
         if (!user) return respond({ content: 'User not found.', ephemeral: true });
-        const guildId = type === 'msg' ? message.guild.id : interaction.guild.id;
+        const guildId = guildOf().id;
         db.prepare('INSERT INTO warns (guildId, userId, moderatorId, reason, timestamp) VALUES (?, ?, ?, ?, ?)').run(guildId, user.id, executor.user.id, reason, Date.now());
-        try { await user.send(`You were warned in ${(type === 'msg' ? message.guild.name : interaction.guild.name)}: ${reason}`); } catch (err) {}
-        // log warn
-        logToMod(guildOf(type, message, interaction), `${user.tag} was warned by ${executor.user.tag}. Reason: ${reason}`);
-        // check warn actions
+        try { await user.send(`You were warned in ${guildOf().name}: ${reason}`); } catch (err) {}
+        logToMod(guildOf(), `${user.tag} was warned by ${executor.user.tag}. Reason: ${reason}`);
         const countRow = db.prepare('SELECT COUNT(*) as c FROM warns WHERE guildId = ? AND userId = ?').get(guildId, user.id);
         const count = countRow ? countRow.c : 0;
         const actionRow = db.prepare('SELECT action, duration FROM warn_actions WHERE guildId = ? AND threshold = ?').get(guildId, count);
-        if (actionRow) {
-          // perform action
-          const action = actionRow.action;
-          const duration = actionRow.duration;
-          await performAutoAction(guildOf(type, message, interaction), user.id, action, duration, executor.user.tag, `Auto-action for reaching ${count} warns`);
-        }
+        if (actionRow) await performAutoAction(guildOf(), user.id, actionRow.action, actionRow.duration, executor.user.tag, `Auto-action for reaching ${count} warns`);
         return respond({ content: `${user.tag} has been warned. Reason: ${reason}` });
       }
 
       case 'warnings': {
         const user = type === 'msg' ? (message.mentions.users.first() || message.author) : (options.getUser('user') || interaction.user);
-        const guildId = type === 'msg' ? message.guild.id : interaction.guild.id;
+        const guildId = guildOf().id;
         const rows = db.prepare('SELECT moderatorId, reason, timestamp FROM warns WHERE guildId = ? AND userId = ? ORDER BY timestamp DESC').all(guildId, user.id);
         if (!rows.length) return respond({ content: `${user.tag} has no warnings.` });
         const out = rows.map((w, i) => `${i+1}. by <@${w.moderatorId}> on ${new Date(w.timestamp).toLocaleString()} — ${w.reason}`).join('\n');
@@ -454,11 +574,11 @@ async function handleCommandRun(context) {
         const executor = type === 'msg' ? message.member : interaction.member;
         if (!executor.permissions.has(PermissionsBitField.Flags.KickMembers) && !executor.permissions.has(PermissionsBitField.Flags.BanMembers)) return respond({ content: 'You need Kick or Ban permission.', ephemeral: true });
         if (!user) return respond({ content: 'User not found.', ephemeral: true });
-        const guildId = type === 'msg' ? message.guild.id : interaction.guild.id;
+        const guildId = guildOf().id;
         const info = db.prepare('SELECT COUNT(*) AS c FROM warns WHERE guildId = ? AND userId = ?').get(guildId, user.id);
         if (!info.c) return respond({ content: `${user.tag} has no warnings.` });
         db.prepare('DELETE FROM warns WHERE guildId = ? AND userId = ?').run(guildId, user.id);
-        logToMod(guildOf(type, message, interaction), `${user.tag}'s warnings were cleared by ${executor.user.tag}. Count: ${info.c}`);
+        logToMod(guildOf(), `${user.tag}'s warnings were cleared by ${executor.user.tag}. Count: ${info.c}`);
         return respond({ content: `Cleared ${info.c} warnings for ${user.tag}.` });
       }
 
@@ -466,9 +586,9 @@ async function handleCommandRun(context) {
         const member = type === 'msg' ? message.mentions.members.first() : options.getMember('user');
         const reason = type === 'msg' ? args.slice(1).join(' ') || 'No reason provided' : (options.getString('reason') || 'No reason provided');
         if (!member) return respond({ content: 'Member not found.', ephemeral: true });
-        const guild = type === 'msg' ? message.guild : interaction.guild;
+        const guild = guildOf();
         const chId = getModLogChannelId(guild.id);
-        const embed = new EmbedBuilder().setTitle('User Report').addFields({ name: 'Reported', value: `${member.user.tag} (${member.id})` }, { name: 'Reporter', value: `${type === 'msg' ? message.author.tag : interaction.user.tag} (${type === 'msg' ? message.author.id : interaction.user.id})` }, { name: 'Reason', value: reason }).setTimestamp();
+        const embed = new EmbedBuilder().setTitle('User Report').addFields({ name: 'Reported', value: `${member.user.tag} (${member.id})` }, { name: 'Reporter', value: `${authorOf().tag} (${authorOf().id})` }, { name: 'Reason', value: reason }).setTimestamp();
         if (chId) {
           const ch = guild.channels.cache.get(chId);
           if (ch && ch.isTextBased()) { ch.send({ embeds: [embed] }); return respond({ content: 'Your report was submitted to the moderation channel.' }); }
@@ -479,7 +599,7 @@ async function handleCommandRun(context) {
       }
 
       case 'tempbanlist': {
-        const guildId = type === 'msg' ? message.guild.id : interaction.guild.id;
+        const guildId = guildOf().id;
         const rows = db.prepare('SELECT userId, unbanAt FROM tempbans WHERE guildId = ? ORDER BY unbanAt ASC').all(guildId);
         if (!rows.length) return respond({ content: 'No active tempbans.' });
         const out = rows.map(r => `<@${r.userId}> — unban at ${new Date(r.unbanAt).toLocaleString()}`).join('\n');
@@ -491,13 +611,16 @@ async function handleCommandRun(context) {
         const member = type === 'msg' ? message.member : interaction.member;
         if (!member.permissions.has(PermissionsBitField.Flags.ManageGuild)) return respond({ content: 'You need Manage Server permission.', ephemeral: true });
         if (!prefix) return respond({ content: 'Provide a prefix.', ephemeral: true });
-        savePrefix(type === 'msg' ? message.guild.id : interaction.guild.id, prefix);
-        PREFIX = prefix;
-        return respond({ content: `Prefix set to \`${prefix}\`.` });
+        savePrefix(guildOf().id, prefix);
+        return respond({ content: `Prefix set to \`${prefix}\` for this server.` });
+      }
+
+      case 'getprefix': {
+        const p = loadPrefix(guildOf().id);
+        return respond({ content: `Server prefix: \`${p}\`` });
       }
 
       case 'setmodlog': {
-        // only slash supports channel option in our registration; for prefix commands expect mention or id
         const member = type === 'msg' ? message.member : interaction.member;
         if (!member.permissions.has(PermissionsBitField.Flags.ManageGuild)) return respond({ content: 'You need Manage Server permission.', ephemeral: true });
         let channelId;
@@ -509,15 +632,14 @@ async function handleCommandRun(context) {
           const ch = options.getChannel('channel');
           channelId = ch.id;
         }
-        setModLogChannel(type === 'msg' ? message.guild.id : interaction.guild.id, channelId);
+        setModLogChannel(guildOf().id, channelId);
         return respond({ content: `Mod-log channel set to <#${channelId}>.` });
       }
 
       case 'warnpolicy': {
-        // Only available as slash (subcommands) — prefix handling could parse "warnpolicy add 3 mute 1d"
         if (type === 'msg') return respond({ content: 'Please use slash command /warnpolicy for managing warn policies.', ephemeral: true });
         const sub = options.getSubcommand();
-        const guildId = interaction.guild.id;
+        const guildId = guildOf().id;
         if (sub === 'add') {
           const threshold = options.getInteger('threshold');
           const action = options.getString('action');
@@ -539,6 +661,7 @@ async function handleCommandRun(context) {
       }
 
       default:
+        // Unknown command — do nothing
         break;
     }
   } catch (err) {
@@ -546,10 +669,6 @@ async function handleCommandRun(context) {
     if (type === 'msg') message.channel.send('An error occurred while running that command.').catch(() => {});
     else interaction.reply({ content: 'An error occurred while running that command.', ephemeral: true }).catch(() => {});
   }
-}
-
-function guildOf(type, message, interaction) {
-  return type === 'msg' ? message.guild : interaction.guild;
 }
 
 async function logToMod(guild, text) {
@@ -562,7 +681,6 @@ async function logToMod(guild, text) {
 }
 
 async function performAutoAction(guild, userId, action, duration, moderatorTag, reason) {
-  // guild may be a Guild object or null
   if (!guild) return;
   const member = await guild.members.fetch(userId).catch(() => null);
   if (action === 'mute') {
@@ -598,19 +716,14 @@ client.on('interactionCreate', async interaction => {
   if (!interaction.isCommand()) return;
   const commandName = interaction.commandName;
   const options = interaction.options;
-  // handle warnpolicy as special: subcommands
-  if (commandName === 'warnpolicy') {
-    await handleCommandRun({ type: 'interaction', interaction, commandName, options });
-    return;
-  }
   await handleCommandRun({ type: 'interaction', interaction, commandName, options });
 });
 
-// Prefix-based commands for compatibility
+// Prefix-based commands for compatibility (make every command available via prefix too)
 client.on('messageCreate', async message => {
   if (message.author.bot) return;
   if (!message.guild) return;
-  const guildPrefix = loadPrefix(message.guild.id) || PREFIX;
+  const guildPrefix = loadPrefix(message.guild.id) || GLOBAL_PREFIX;
   if (!message.content.startsWith(guildPrefix)) return;
   const args = message.content.slice(guildPrefix.length).trim().split(/ +/);
   const cmd = args.shift().toLowerCase();
