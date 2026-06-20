@@ -1,1015 +1,363 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
-import {
-  Client,
-  EmbedBuilder,
-  Events,
-  GatewayIntentBits,
-  PermissionFlagsBits,
-  Partials,
-  RESTJSONErrorCodes,
-  SlashCommandBuilder,
-} from "discord.js";
+// index.js — rewritten: moderation + utility commands in a single-file bot
+// Requires node 16+, discord.js v14, and setting DISCORD_TOKEN (and optional PREFIX) in environment
 
-const token = process.env.DISCORD_TOKEN;
-const appDirectory = join(dirname(fileURLToPath(import.meta.url)), "..");
-const auditLogConfigPath = join(appDirectory, "data", "audit-log-channels.json");
-const warningsPath = join(appDirectory, "data", "warnings.json");
+const fs = require('fs');
+const path = require('path');
+const { Client, GatewayIntentBits, Partials, PermissionsBitField, EmbedBuilder } = require('discord.js');
 
-if (!token) {
-  throw new Error("DISCORD_TOKEN is missing. Add your Discord bot token as a secret named DISCORD_TOKEN.");
+// Configuration
+const TOKEN = process.env.DISCORD_TOKEN; // set this in your environment or use a .env loader
+const PREFIX = process.env.PREFIX || '!';
+const DATA_DIR = path.join(__dirname, 'data');
+const WARNS_FILE = path.join(DATA_DIR, 'warns.json');
+
+if (!TOKEN) {
+  console.error('ERROR: DISCORD_TOKEN environment variable not set');
+  process.exit(1);
 }
 
-async function loadAuditLogChannels() {
-  try {
-    const file = await readFile(auditLogConfigPath, "utf8");
-    return JSON.parse(file);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return {};
-    }
+// Ensure data dir exists
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(WARNS_FILE)) fs.writeFileSync(WARNS_FILE, JSON.stringify({}), 'utf8');
 
-    throw error;
+function loadWarns() {
+  try {
+    return JSON.parse(fs.readFileSync(WARNS_FILE, 'utf8'));
+  } catch (err) {
+    console.error('Failed to read warns.json, resetting:', err);
+    fs.writeFileSync(WARNS_FILE, JSON.stringify({}), 'utf8');
+    return {};
   }
 }
-
-async function saveAuditLogChannels(channels) {
-  await mkdir(dirname(auditLogConfigPath), { recursive: true });
-  await writeFile(auditLogConfigPath, `${JSON.stringify(channels, null, 2)}\n`);
+function saveWarns(data) {
+  fs.writeFileSync(WARNS_FILE, JSON.stringify(data, null, 2), 'utf8');
 }
-
-const auditLogChannels = await loadAuditLogChannels();
-
-async function loadWarnings() {
-  try {
-    const file = await readFile(warningsPath, "utf8");
-    return JSON.parse(file);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return {};
-    }
-
-    throw error;
-  }
-}
-
-async function saveWarnings(warnings) {
-  await mkdir(dirname(warningsPath), { recursive: true });
-  await writeFile(warningsPath, `${JSON.stringify(warnings, null, 2)}\n`);
-}
-
-const warnings = await loadWarnings();
-
-const commands = [
-  new SlashCommandBuilder()
-    .setName("ping")
-    .setDescription("Check whether the bot is online"),
-  new SlashCommandBuilder()
-    .setName("server")
-    .setDescription("Show information about this server"),
-  new SlashCommandBuilder()
-    .setName("about")
-    .setDescription("Learn what this bot can do"),
-  new SlashCommandBuilder()
-    .setName("audit-log")
-    .setDescription("Set the channel used for moderation audit logs")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild)
-    .addChannelOption((option) =>
-      option
-        .setName("channel")
-        .setDescription("The existing channel where moderation logs should be posted")
-        .setRequired(true)
-    ),
-  new SlashCommandBuilder()
-    .setName("warn")
-    .setDescription("Warn a member and save it to their warning history")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
-    .addUserOption((option) =>
-      option
-        .setName("user")
-        .setDescription("The member to warn")
-        .setRequired(true)
-    )
-    .addStringOption((option) =>
-      option
-        .setName("reason")
-        .setDescription("The reason for this warning")
-        .setMaxLength(512)
-        .setRequired(true)
-    ),
-  new SlashCommandBuilder()
-    .setName("warnings")
-    .setDescription("View a member's warning history")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
-    .addUserOption((option) =>
-      option
-        .setName("user")
-        .setDescription("The member whose warnings you want to view")
-        .setRequired(true)
-    ),
-  new SlashCommandBuilder()
-    .setName("userinfo")
-    .setDescription("Show account, server, role, and warning details for a member")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
-    .addUserOption((option) =>
-      option
-        .setName("user")
-        .setDescription("The member to look up")
-        .setRequired(true)
-    ),
-  new SlashCommandBuilder()
-    .setName("clearwarnings")
-    .setDescription("Remove all warnings from a member")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
-    .addUserOption((option) =>
-      option
-        .setName("user")
-        .setDescription("The member whose warnings should be removed")
-        .setRequired(true)
-    )
-    .addStringOption((option) =>
-      option
-        .setName("reason")
-        .setDescription("The reason for clearing these warnings")
-        .setMaxLength(512)
-    ),
-  new SlashCommandBuilder()
-    .setName("removewarning")
-    .setDescription("Remove one warning from a member")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
-    .addUserOption((option) =>
-      option
-        .setName("user")
-        .setDescription("The member whose warning should be removed")
-        .setRequired(true)
-    )
-    .addIntegerOption((option) =>
-      option
-        .setName("number")
-        .setDescription("The warning number from /warnings, where 1 is the most recent")
-        .setMinValue(1)
-        .setMaxValue(10)
-        .setRequired(true)
-    )
-    .addStringOption((option) =>
-      option
-        .setName("reason")
-        .setDescription("The reason for removing this warning")
-        .setMaxLength(512)
-    ),
-  new SlashCommandBuilder()
-    .setName("purge")
-    .setDescription("Bulk-delete recent messages from this channel")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages)
-    .addIntegerOption((option) =>
-      option
-        .setName("amount")
-        .setDescription("How many recent messages to delete")
-        .setMinValue(1)
-        .setMaxValue(100)
-        .setRequired(true)
-    )
-    .addStringOption((option) =>
-      option
-        .setName("reason")
-        .setDescription("The reason for this purge")
-        .setMaxLength(512)
-    ),
-  new SlashCommandBuilder()
-    .setName("slowmode")
-    .setDescription("Set the slowmode cooldown for this channel")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
-    .addIntegerOption((option) =>
-      option
-        .setName("seconds")
-        .setDescription("Cooldown in seconds. Use 0 to turn slowmode off")
-        .setMinValue(0)
-        .setMaxValue(21600)
-        .setRequired(true)
-    )
-    .addStringOption((option) =>
-      option
-        .setName("reason")
-        .setDescription("The reason for changing slowmode")
-        .setMaxLength(512)
-    ),
-  new SlashCommandBuilder()
-    .setName("lock")
-    .setDescription("Lock this channel so regular members cannot send messages")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
-    .addStringOption((option) =>
-      option
-        .setName("reason")
-        .setDescription("The reason for locking this channel")
-        .setMaxLength(512)
-    ),
-  new SlashCommandBuilder()
-    .setName("unlock")
-    .setDescription("Unlock this channel so regular members can send messages again")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageChannels)
-    .addStringOption((option) =>
-      option
-        .setName("reason")
-        .setDescription("The reason for unlocking this channel")
-        .setMaxLength(512)
-    ),
-  new SlashCommandBuilder()
-    .setName("kick")
-    .setDescription("Kick a member from the server")
-    .setDefaultMemberPermissions(PermissionFlagsBits.KickMembers)
-    .addUserOption((option) =>
-      option
-        .setName("user")
-        .setDescription("The member to kick")
-        .setRequired(true)
-    )
-    .addStringOption((option) =>
-      option
-        .setName("reason")
-        .setDescription("The reason for this kick")
-        .setMaxLength(512)
-    ),
-  new SlashCommandBuilder()
-    .setName("ban")
-    .setDescription("Ban a member from the server")
-    .setDefaultMemberPermissions(PermissionFlagsBits.BanMembers)
-    .addUserOption((option) =>
-      option
-        .setName("user")
-        .setDescription("The member to ban")
-        .setRequired(true)
-    )
-    .addStringOption((option) =>
-      option
-        .setName("reason")
-        .setDescription("The reason for this ban")
-        .setMaxLength(512)
-    ),
-  new SlashCommandBuilder()
-    .setName("timeout")
-    .setDescription("Temporarily timeout a member")
-    .setDefaultMemberPermissions(PermissionFlagsBits.ModerateMembers)
-    .addUserOption((option) =>
-      option
-        .setName("user")
-        .setDescription("The member to timeout")
-        .setRequired(true)
-    )
-    .addIntegerOption((option) =>
-      option
-        .setName("minutes")
-        .setDescription("How many minutes the timeout should last")
-        .setMinValue(1)
-        .setMaxValue(40320)
-        .setRequired(true)
-    )
-    .addStringOption((option) =>
-      option
-        .setName("reason")
-        .setDescription("The reason for this timeout")
-        .setMaxLength(512)
-    ),
-].map((command) => command.toJSON());
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
-  partials: [Partials.Channel, Partials.Message],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessageReactions
+  ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction]
 });
 
-function formatReason(interaction, reason) {
-  const moderator = interaction.user.tag ?? interaction.user.username;
-  return reason ? `${reason} — by ${moderator}` : `Action taken by ${moderator}`;
+client.once('ready', () => {
+  console.log(`Logged in as ${client.user.tag}`);
+  client.user.setActivity(`${PREFIX}help | ${client.guilds.cache.size} guild(s)`);
+});
+
+// Utility helpers
+function hasPermission(member, perm) {
+  return member.permissions.has(perm);
 }
 
-async function getTargetMember(interaction) {
-  const user = interaction.options.getUser("user", true);
-  const member = await interaction.guild.members.fetch(user.id).catch(() => null);
-
-  return { user, member };
+function formatDate(ts) {
+  return new Date(ts).toLocaleString();
 }
 
-async function requireGuild(interaction) {
-  if (!interaction.guild) {
-    await interaction.reply({
-      content: "This command only works inside a Discord server.",
-      ephemeral: true,
-    });
-    return false;
+// Moderation helpers
+async function ensureMutedRole(guild) {
+  let role = guild.roles.cache.find(r => r.name === 'Muted');
+  if (!role) {
+    try {
+      role = await guild.roles.create({ name: 'Muted', permissions: [] });
+      // Deny SEND_MESSAGES in all text channels for the Muted role
+      for (const [, channel] of guild.channels.cache) {
+        try {
+          if (channel.isTextBased()) {
+            await channel.permissionOverwrites.edit(role, { SendMessages: false, AddReactions: false, Speak: false });
+          }
+        } catch (err) {
+          // ignore per-channel failures
+        }
+      }
+    } catch (err) {
+      console.error('Failed to create Muted role:', err);
+    }
   }
-
-  return true;
+  return role;
 }
 
-function isSelfAction(interaction, user) {
-  return user.id === interaction.user.id || user.id === client.user?.id;
-}
+// Command handling
+client.on('messageCreate', async message => {
+  if (message.author.bot) return;
+  if (!message.guild) return; // guild-only
 
-async function setAuditLogChannel(interaction) {
-  if (!(await requireGuild(interaction))) {
-    return;
-  }
-
-  const channel = interaction.options.getChannel("channel", true);
-
-  if (!channel.isTextBased()) {
-    await interaction.reply({
-      content: "Please choose a channel where I can send messages.",
-      ephemeral: true,
-    });
-    return;
-  }
-
-  auditLogChannels[interaction.guild.id] = channel.id;
-  await saveAuditLogChannels(auditLogChannels);
-  await interaction.reply({
-    content: `Audit logs will now be posted in ${channel}.`,
-    allowedMentions: { parse: [] },
-    ephemeral: true,
-  });
-}
-
-async function sendAuditLog(interaction, details) {
-  const channelId = auditLogChannels[interaction.guild.id];
-
-  if (!channelId) {
-    return;
-  }
-
-  const channel = await client.channels.fetch(channelId).catch(() => null);
-
-  if (!channel?.isTextBased()) {
-    console.error(`Audit log channel ${channelId} is unavailable or is not text-based`);
-    return;
-  }
-
-  const fields = [
-    { name: "Action", value: details.action, inline: true },
-    { name: "User", value: `${details.user.tag} (${details.user.id})`, inline: true },
-    { name: "Moderator", value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
-    { name: "Reason", value: details.reason || "No reason provided", inline: false },
-  ];
-
-  if (details.duration) {
-    fields.push({ name: "Duration", value: details.duration, inline: true });
-  }
-
-  if (details.warningCount) {
-    fields.push({ name: "Total warnings", value: String(details.warningCount), inline: true });
-  }
-
-  if (details.clearedWarnings !== undefined) {
-    fields.push({ name: "Cleared warnings", value: String(details.clearedWarnings), inline: true });
-  }
-
-  if (details.removedWarning) {
-    fields.push({ name: "Removed warning", value: details.removedWarning.slice(0, 1024), inline: false });
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle("Moderation audit log")
-    .setColor(0x5865f2)
-    .addFields(fields)
-    .setTimestamp();
-
-  await channel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch((error) => {
-    console.error("Failed to send audit log", error);
-  });
-}
-
-function getGuildWarnings(guildId) {
-  if (!warnings[guildId]) {
-    warnings[guildId] = {};
-  }
-
-  return warnings[guildId];
-}
-
-function getUserWarnings(guildId, userId) {
-  const guildWarnings = getGuildWarnings(guildId);
-
-  if (!guildWarnings[userId]) {
-    guildWarnings[userId] = [];
-  }
-
-  return guildWarnings[userId];
-}
-
-async function sendMessageDeleteAuditLog(message) {
-  const guild = message.guild;
-
-  if (!guild) {
-    return;
-  }
-
-  const channelId = auditLogChannels[guild.id];
-
-  if (!channelId) {
-    return;
-  }
-
-  const auditChannel = await client.channels.fetch(channelId).catch(() => null);
-
-  if (!auditChannel?.isTextBased()) {
-    console.error(`Audit log channel ${channelId} is unavailable or is not text-based`);
-    return;
-  }
-
-  const author = message.author
-    ? `${message.author.tag} (${message.author.id})`
-    : "Unknown or uncached user";
-  const deletedChannel = message.channelId ? `<#${message.channelId}>` : "Unknown channel";
-  const content = message.content?.trim();
-  const attachments = message.attachments?.size ?? 0;
-  const fields = [
-    { name: "Channel", value: deletedChannel, inline: true },
-    { name: "Author", value: author, inline: true },
-    { name: "Message ID", value: message.id, inline: true },
-    {
-      name: "Content",
-      value: content ? content.slice(0, 1024) : "Unavailable. Enable Message Content Intent in the Discord Developer Portal to log message text.",
-      inline: false,
-    },
-  ];
-
-  if (attachments > 0) {
-    fields.push({ name: "Attachments", value: String(attachments), inline: true });
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle("Message deleted")
-    .setColor(0xed4245)
-    .addFields(fields)
-    .setTimestamp();
-
-  await auditChannel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch((error) => {
-    console.error("Failed to send message delete audit log", error);
-  });
-}
-
-async function sendPurgeAuditLog(interaction, details) {
-  const channelId = auditLogChannels[interaction.guild.id];
-
-  if (!channelId) {
-    return;
-  }
-
-  const auditChannel = await client.channels.fetch(channelId).catch(() => null);
-
-  if (!auditChannel?.isTextBased()) {
-    console.error(`Audit log channel ${channelId} is unavailable or is not text-based`);
-    return;
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle("Messages purged")
-    .setColor(0xfee75c)
-    .addFields([
-      { name: "Channel", value: `${interaction.channel}`, inline: true },
-      { name: "Deleted", value: String(details.deletedCount), inline: true },
-      { name: "Requested", value: String(details.requestedCount), inline: true },
-      { name: "Moderator", value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
-      { name: "Reason", value: details.reason || "No reason provided", inline: false },
-    ])
-    .setTimestamp();
-
-  await auditChannel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch((error) => {
-    console.error("Failed to send purge audit log", error);
-  });
-}
-
-async function sendSlowmodeAuditLog(interaction, details) {
-  const channelId = auditLogChannels[interaction.guild.id];
-
-  if (!channelId) {
-    return;
-  }
-
-  const auditChannel = await client.channels.fetch(channelId).catch(() => null);
-
-  if (!auditChannel?.isTextBased()) {
-    console.error(`Audit log channel ${channelId} is unavailable or is not text-based`);
-    return;
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle("Slowmode updated")
-    .setColor(0x57f287)
-    .addFields([
-      { name: "Channel", value: `${interaction.channel}`, inline: true },
-      { name: "Cooldown", value: `${details.seconds} second${details.seconds === 1 ? "" : "s"}`, inline: true },
-      { name: "Moderator", value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
-      { name: "Reason", value: details.reason || "No reason provided", inline: false },
-    ])
-    .setTimestamp();
-
-  await auditChannel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch((error) => {
-    console.error("Failed to send slowmode audit log", error);
-  });
-}
-
-async function sendChannelLockAuditLog(interaction, details) {
-  const channelId = auditLogChannels[interaction.guild.id];
-
-  if (!channelId) {
-    return;
-  }
-
-  const auditChannel = await client.channels.fetch(channelId).catch(() => null);
-
-  if (!auditChannel?.isTextBased()) {
-    console.error(`Audit log channel ${channelId} is unavailable or is not text-based`);
-    return;
-  }
-
-  const embed = new EmbedBuilder()
-    .setTitle("Channel permissions updated")
-    .setColor(details.action === "Lock" ? 0xed4245 : 0x57f287)
-    .addFields([
-      { name: "Action", value: details.action, inline: true },
-      { name: "Channel", value: `${interaction.channel}`, inline: true },
-      { name: "Moderator", value: `${interaction.user.tag} (${interaction.user.id})`, inline: true },
-      { name: "Reason", value: details.reason || "No reason provided", inline: false },
-    ])
-    .setTimestamp();
-
-  await auditChannel.send({ embeds: [embed], allowedMentions: { parse: [] } }).catch((error) => {
-    console.error("Failed to send channel lock audit log", error);
-  });
-}
-
-client.once(Events.ClientReady, async (readyClient) => {
-  console.log(`Logged in as ${readyClient.user.tag}`);
+  const prefix = PREFIX;
+  if (!message.content.startsWith(prefix)) return;
+  const args = message.content.slice(prefix.length).trim().split(/ +/);
+  const cmd = args.shift().toLowerCase();
 
   try {
-    await readyClient.application.commands.set(commands);
-    console.log("Slash commands registered");
-  } catch (error) {
-    console.error("Failed to register slash commands", error);
+    switch (cmd) {
+      // ------------------------ Utility commands ------------------------
+      case 'ping': {
+        const sent = await message.channel.send('Pinging...');
+        const latency = sent.createdTimestamp - message.createdTimestamp;
+        const api = Math.round(client.ws.ping);
+        sent.edit(`Pong! Latency: ${latency}ms. API: ${api}ms`);
+        break;
+      }
+
+      case 'avatar': {
+        const user = message.mentions.users.first() || message.author;
+        return message.channel.send({ content: user.displayAvatarURL({ dynamic: true, size: 1024 }) });
+      }
+
+      case 'serverinfo': {
+        const g = message.guild;
+        const embed = new EmbedBuilder()
+          .setTitle(`${g.name} — Info`)
+          .setThumbnail(g.iconURL({ dynamic: true }))
+          .addFields(
+            { name: 'ID', value: g.id, inline: true },
+            { name: 'Members', value: `${g.memberCount}`, inline: true },
+            { name: 'Created', value: formatDate(g.createdTimestamp), inline: true }
+          )
+          .setFooter({ text: `Region: ${g.preferredLocale || 'unknown'}` });
+        return message.channel.send({ embeds: [embed] });
+      }
+
+      case 'userinfo': {
+        const member = message.mentions.members.first() || message.member;
+        const user = member.user;
+        const embed = new EmbedBuilder()
+          .setAuthor({ name: `${user.tag}`, iconURL: user.displayAvatarURL({ dynamic: true }) })
+          .addFields(
+            { name: 'ID', value: user.id, inline: true },
+            { name: 'Joined', value: formatDate(member.joinedTimestamp || 0), inline: true },
+            { name: 'Created', value: formatDate(user.createdTimestamp), inline: true }
+          );
+        return message.channel.send({ embeds: [embed] });
+      }
+
+      case 'roles': {
+        const roles = message.guild.roles.cache
+          .filter(r => r.id !== message.guild.id)
+          .sort((a, b) => b.position - a.position)
+          .map(r => r.name)
+          .slice(0, 20);
+        return message.channel.send(`Roles (${roles.length} shown): ${roles.join(', ')}`);
+      }
+
+      case 'say': {
+        if (!message.member.permissions.has(PermissionsBitField.Flags.ManageMessages))
+          return message.reply('You do not have permission to use this command.');
+        const text = args.join(' ');
+        if (!text) return message.reply('Provide a message to send.');
+        await message.delete().catch(() => {});
+        return message.channel.send(text);
+      }
+
+      case 'embed': {
+        if (!message.member.permissions.has(PermissionsBitField.Flags.ManageMessages))
+          return message.reply('You do not have permission to use this command.');
+        const text = args.join(' ');
+        if (!text) return message.reply('Provide a message to send.');
+        const embed = new EmbedBuilder().setDescription(text).setColor(0x00AE86);
+        await message.delete().catch(() => {});
+        return message.channel.send({ embeds: [embed] });
+      }
+
+      case 'poll': {
+        // Usage: !poll "Question" option1 | option2 | option3
+        const content = message.content.slice(prefix.length + cmd.length).trim();
+        const match = content.match(/"([^"]+)"\s*(.+)/);
+        if (!match) return message.reply('Usage: !poll "Question" option1 | option2 | option3');
+        const question = match[1];
+        const opts = match[2].split('|').map(o => o.trim()).filter(Boolean).slice(0, 10);
+        if (opts.length < 2) return message.reply('Provide at least 2 options.');
+        const emojis = ['1️⃣','2️⃣','3️⃣','4️⃣','5️⃣','6️⃣','7️⃣','8️⃣','9️⃣','🔟'];
+        const embed = new EmbedBuilder().setTitle(question).setDescription(opts.map((o, i) => `${emojis[i]} ${o}`).join('\n'));
+        const poll = await message.channel.send({ embeds: [embed] });
+        for (let i = 0; i < opts.length; i++) await poll.react(emojis[i]);
+        break;
+      }
+
+      case 'help': {
+        const embed = new EmbedBuilder().setTitle('Help — Commands')
+          .setDescription(`Prefix: ${PREFIX}`)
+          .addFields(
+            { name: 'Moderation', value: '`kick`, `ban`, `tempban`, `mute`, `unmute`, `clear`, `warn`, `warnings`, `clearwarns`' },
+            { name: 'Utility', value: '`ping`, `avatar`, `serverinfo`, `userinfo`, `roles`, `say`, `embed`, `poll`, `help`' }
+          )
+          .setFooter({ text: 'Moderation commands require appropriate permissions.' });
+        return message.channel.send({ embeds: [embed] });
+      }
+
+      // ------------------------ Moderation commands ------------------------
+      case 'kick': {
+        if (!message.member.permissions.has(PermissionsBitField.Flags.KickMembers))
+          return message.reply('You need Kick Members permission.');
+        const member = message.mentions.members.first();
+        if (!member) return message.reply('Mention a member to kick.');
+        if (!member.kickable) return message.reply('I cannot kick that user.');
+        const reason = args.join(' ') || 'No reason provided';
+        await member.kick(reason).catch(err => message.reply('Failed to kick: ' + err.message));
+        return message.channel.send(`${member.user.tag} was kicked. Reason: ${reason}`);
+      }
+
+      case 'ban': {
+        if (!message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+          return message.reply('You need Ban Members permission.');
+        const member = message.mentions.members.first();
+        if (!member) return message.reply('Mention a member to ban.');
+        const reason = args.join(' ') || 'No reason provided';
+        await member.ban({ days: 0, reason }).catch(err => message.reply('Failed to ban: ' + err.message));
+        return message.channel.send(`${member.user.tag} was banned. Reason: ${reason}`);
+      }
+
+      case 'tempban': {
+        // !tempban @user 1d reason
+        if (!message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+          return message.reply('You need Ban Members permission.');
+        const member = message.mentions.members.first();
+        if (!member) return message.reply('Mention a member to tempban.');
+        const durationArg = args.shift();
+        if (!durationArg) return message.reply('Provide a duration like 1d, 2h, 30m');
+        const reason = args.join(' ') || 'No reason provided';
+        const ms = parseDuration(durationArg);
+        if (!ms) return message.reply('Invalid duration format. Use 1d, 2h, 30m.');
+        await member.ban({ days: 0, reason }).catch(err => message.reply('Failed to ban: ' + err.message));
+        message.channel.send(`${member.user.tag} was temp-banned for ${durationArg}. Reason: ${reason}`);
+
+        // Schedule unban (in-memory). Note: will not persist through restarts.
+        setTimeout(async () => {
+          try {
+            await message.guild.bans.remove(member.id);
+            message.channel.send(`${member.user.tag} was automatically unbanned (tempban expired).`);
+          } catch (err) {
+            // ignore
+          }
+        }, ms);
+        break;
+      }
+
+      case 'mute': {
+        if (!message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers) && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+          return message.reply('You need Moderate Members or Manage Roles permission.');
+        const member = message.mentions.members.first();
+        if (!member) return message.reply('Mention a member to mute.');
+        const role = await ensureMutedRole(message.guild);
+        if (!role) return message.reply('Could not ensure Muted role exists.');
+        if (member.roles.cache.has(role.id)) return message.reply('Member is already muted.');
+        await member.roles.add(role, `Muted by ${message.author.tag}`).catch(err => message.reply('Failed to add Muted role: ' + err.message));
+        return message.channel.send(`${member.user.tag} has been muted.`);
+      }
+
+      case 'unmute': {
+        if (!message.member.permissions.has(PermissionsBitField.Flags.ModerateMembers) && !message.member.permissions.has(PermissionsBitField.Flags.ManageRoles))
+          return message.reply('You need Moderate Members or Manage Roles permission.');
+        const member = message.mentions.members.first();
+        if (!member) return message.reply('Mention a member to unmute.');
+        const role = message.guild.roles.cache.find(r => r.name === 'Muted');
+        if (!role) return message.reply('No Muted role found.');
+        if (!member.roles.cache.has(role.id)) return message.reply('Member is not muted.');
+        await member.roles.remove(role, `Unmuted by ${message.author.tag}`).catch(err => message.reply('Failed to remove Muted role: ' + err.message));
+        return message.channel.send(`${member.user.tag} has been unmuted.`);
+      }
+
+      case 'clear': {
+        if (!message.member.permissions.has(PermissionsBitField.Flags.ManageMessages))
+          return message.reply('You need Manage Messages permission.');
+        const count = parseInt(args[0], 10);
+        if (!count || count < 1 || count > 100) return message.reply('Provide a number between 1 and 100.');
+        const deleted = await message.channel.bulkDelete(count, true).catch(err => message.reply('Failed to delete messages: ' + err.message));
+        return message.channel.send(`Deleted ${deleted ? deleted.size : 0} messages.`).then(m => setTimeout(() => m.delete().catch(() => {}), 5000));
+      }
+
+      case 'warn': {
+        if (!message.member.permissions.has(PermissionsBitField.Flags.KickMembers) && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+          return message.reply('You need Kick or Ban permission to warn.');
+        const member = message.mentions.users.first();
+        if (!member) return message.reply('Mention a user to warn.');
+        const reason = args.join(' ') || 'No reason provided';
+        const warns = loadWarns();
+        if (!warns[message.guild.id]) warns[message.guild.id] = {};
+        if (!warns[message.guild.id][member.id]) warns[message.guild.id][member.id] = [];
+        warns[message.guild.id][member.id].push({ moderator: message.author.id, reason, timestamp: Date.now() });
+        saveWarns(warns);
+        message.channel.send(`${member.tag} has been warned. Reason: ${reason}`);
+        try { await member.send(`You were warned in ${message.guild.name}: ${reason}`); } catch (err) {}
+        break;
+      }
+
+      case 'warnings': {
+        const user = message.mentions.users.first() || message.author;
+        const warns = loadWarns();
+        const list = (warns[message.guild.id] && warns[message.guild.id][user.id]) || [];
+        if (!list.length) return message.channel.send(`${user.tag} has no warnings.`);
+        const out = list.map((w, i) => `${i+1}. by <@${w.moderator}> on ${formatDate(w.timestamp)} — ${w.reason}`).join('\n');
+        const embed = new EmbedBuilder().setTitle(`Warnings for ${user.tag}`).setDescription(out);
+        return message.channel.send({ embeds: [embed] });
+      }
+
+      case 'clearwarns': {
+        if (!message.member.permissions.has(PermissionsBitField.Flags.KickMembers) && !message.member.permissions.has(PermissionsBitField.Flags.BanMembers))
+          return message.reply('You need Kick or Ban permission.');
+        const user = message.mentions.users.first();
+        if (!user) return message.reply('Mention a user to clear warnings for.');
+        const warns = loadWarns();
+        if (warns[message.guild.id] && warns[message.guild.id][user.id]) {
+          delete warns[message.guild.id][user.id];
+          saveWarns(warns);
+          return message.channel.send(`Cleared warnings for ${user.tag}.`);
+        }
+        return message.channel.send(`${user.tag} has no warnings.`);
+      }
+
+      case 'report': {
+        // !report @user reason
+        const reported = message.mentions.members.first();
+        if (!reported) return message.reply('Mention a user to report.');
+        const reason = args.join(' ') || 'No reason provided';
+        // Find channel named 'mod-log' or 'reports'
+        const ch = message.guild.channels.cache.find(c => ['mod-log','reports','moderation'].includes(c.name));
+        const embed = new EmbedBuilder()
+          .setTitle('User Report')
+          .addFields(
+            { name: 'Reported', value: `${reported.user.tag} (${reported.id})` },
+            { name: 'Reporter', value: `${message.author.tag} (${message.author.id})` },
+            { name: 'Reason', value: reason }
+          )
+          .setTimestamp();
+        if (ch && ch.isTextBased()) {
+          ch.send({ embeds: [embed] });
+          message.reply('Your report was submitted to the moderation channel.');
+        } else {
+          // fallback: DM server owner
+          try {
+            await message.guild.fetchOwner().then(owner => owner.send({ embeds: [embed] }));
+            message.reply('No mod channel found — report sent to server owner.');
+          } catch (err) {
+            message.reply('Could not send report to moderators.');
+          }
+        }
+        break;
+      }
+
+      default:
+        // Unknown command — no reply to avoid spam
+        break;
+    }
+  } catch (err) {
+    console.error('Command error:', err);
+    message.reply('An error occurred while running that command.');
   }
 });
 
-client.on(Events.MessageDelete, async (message) => {
-  await sendMessageDeleteAuditLog(message);
-});
-
-client.on(Events.InteractionCreate, async (interaction) => {
-  if (!interaction.isChatInputCommand()) {
-    return;
-  }
-
-  try {
-    if (interaction.commandName === "ping") {
-      await interaction.reply(`Pong! WebSocket latency is ${client.ws.ping}ms.`);
-      return;
-    }
-
-    if (interaction.commandName === "server") {
-      const guild = interaction.guild;
-
-      if (!guild) {
-        await interaction.reply("This command only works inside a Discord server.");
-        return;
-      }
-
-      await interaction.reply({
-        content: [
-          `Server: ${guild.name}`,
-          `Members: ${guild.memberCount}`,
-          `Created: <t:${Math.floor(guild.createdTimestamp / 1000)}:D>`,
-        ].join("\n"),
-        allowedMentions: { parse: [] },
-      });
-      return;
-    }
-
-    if (interaction.commandName === "about") {
-      await interaction.reply(
-        "I am a Node.js Discord bot with slash commands. Try /ping, /server, /audit-log, /warn, /warnings, /userinfo, /clearwarnings, /removewarning, /purge, /slowmode, /lock, /unlock, /kick, /ban, or /timeout."
-      );
-      return;
-    }
-
-    if (interaction.commandName === "audit-log") {
-      await setAuditLogChannel(interaction);
-      return;
-    }
-
-    if (interaction.commandName === "warn") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      const { user } = await getTargetMember(interaction);
-      const reason = interaction.options.getString("reason", true);
-
-      if (isSelfAction(interaction, user)) {
-        await interaction.reply({ content: "That action is not allowed for this user.", ephemeral: true });
-        return;
-      }
-
-      const userWarnings = getUserWarnings(interaction.guild.id, user.id);
-      const warning = {
-        id: `${Date.now()}-${interaction.id}`,
-        reason,
-        moderatorId: interaction.user.id,
-        moderatorTag: interaction.user.tag,
-        createdAt: new Date().toISOString(),
-      };
-
-      userWarnings.push(warning);
-      await saveWarnings(warnings);
-      await sendAuditLog(interaction, {
-        action: "Warn",
-        user,
-        reason,
-        warningCount: userWarnings.length,
-      });
-      await interaction.reply({
-        content: `Warned ${user.tag}. They now have ${userWarnings.length} warning${userWarnings.length === 1 ? "" : "s"}.`,
-        allowedMentions: { parse: [] },
-      });
-      return;
-    }
-
-    if (interaction.commandName === "warnings") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      const user = interaction.options.getUser("user", true);
-      const userWarnings = getUserWarnings(interaction.guild.id, user.id);
-
-      if (userWarnings.length === 0) {
-        await interaction.reply({
-          content: `${user.tag} has no warnings.`,
-          allowedMentions: { parse: [] },
-          ephemeral: true,
-        });
-        return;
-      }
-
-      const recentWarnings = userWarnings.slice(-10).reverse();
-      const lines = recentWarnings.map((warning, index) => {
-        const timestamp = Math.floor(new Date(warning.createdAt).getTime() / 1000);
-        return `${index + 1}. <t:${timestamp}:R> by ${warning.moderatorTag}: ${warning.reason}`;
-      });
-
-      await interaction.reply({
-        content: [
-          `${user.tag} has ${userWarnings.length} warning${userWarnings.length === 1 ? "" : "s"}.`,
-          "",
-          ...lines,
-        ].join("\n").slice(0, 2000),
-        allowedMentions: { parse: [] },
-        ephemeral: true,
-      });
-      return;
-    }
-
-    if (interaction.commandName === "removewarning") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      const user = interaction.options.getUser("user", true);
-      const number = interaction.options.getInteger("number", true);
-      const reason = interaction.options.getString("reason");
-      const userWarnings = getUserWarnings(interaction.guild.id, user.id);
-
-      if (userWarnings.length === 0) {
-        await interaction.reply({
-          content: `${user.tag} has no warnings to remove.`,
-          allowedMentions: { parse: [] },
-          ephemeral: true,
-        });
-        return;
-      }
-
-      if (number > Math.min(userWarnings.length, 10)) {
-        await interaction.reply({
-          content: `That warning number is not currently shown by /warnings. Choose a number from 1 to ${Math.min(userWarnings.length, 10)}.`,
-          ephemeral: true,
-        });
-        return;
-      }
-
-      const actualIndex = userWarnings.length - number;
-      const [removedWarning] = userWarnings.splice(actualIndex, 1);
-
-      await saveWarnings(warnings);
-      await sendAuditLog(interaction, {
-        action: "Remove warning",
-        user,
-        reason,
-        removedWarning: removedWarning.reason,
-        warningCount: userWarnings.length,
-      });
-      await interaction.reply({
-        content: `Removed warning #${number} from ${user.tag}. They now have ${userWarnings.length} warning${userWarnings.length === 1 ? "" : "s"}.`,
-        allowedMentions: { parse: [] },
-      });
-      return;
-    }
-
-    if (interaction.commandName === "userinfo") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      const user = interaction.options.getUser("user", true);
-      const member = await interaction.guild.members.fetch(user.id).catch(() => null);
-      const userWarnings = getUserWarnings(interaction.guild.id, user.id);
-      const roles = member
-        ? member.roles.cache
-          .filter((role) => role.id !== interaction.guild.id)
-          .sort((first, second) => second.position - first.position)
-          .map((role) => `${role}`)
-          .slice(0, 10)
-        : [];
-      const createdTimestamp = Math.floor(user.createdTimestamp / 1000);
-      const joinedTimestamp = member?.joinedTimestamp
-        ? Math.floor(member.joinedTimestamp / 1000)
-        : null;
-
-      const embed = new EmbedBuilder()
-        .setTitle(`User info: ${user.tag}`)
-        .setThumbnail(user.displayAvatarURL())
-        .setColor(0x5865f2)
-        .addFields([
-          { name: "User", value: `${user} (${user.id})`, inline: false },
-          { name: "Account created", value: `<t:${createdTimestamp}:D> (<t:${createdTimestamp}:R>)`, inline: true },
-          {
-            name: "Joined server",
-            value: joinedTimestamp ? `<t:${joinedTimestamp}:D> (<t:${joinedTimestamp}:R>)` : "Not currently in this server",
-            inline: true,
-          },
-          { name: "Warnings", value: String(userWarnings.length), inline: true },
-          { name: "Roles", value: roles.length ? roles.join(", ").slice(0, 1024) : "No roles", inline: false },
-        ])
-        .setTimestamp();
-
-      await interaction.reply({ embeds: [embed], allowedMentions: { parse: [] }, ephemeral: true });
-      return;
-    }
-
-    if (interaction.commandName === "clearwarnings") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      const user = interaction.options.getUser("user", true);
-      const reason = interaction.options.getString("reason");
-      const guildWarnings = getGuildWarnings(interaction.guild.id);
-      const clearedWarnings = guildWarnings[user.id]?.length ?? 0;
-
-      delete guildWarnings[user.id];
-      await saveWarnings(warnings);
-      await sendAuditLog(interaction, {
-        action: "Clear warnings",
-        user,
-        reason,
-        clearedWarnings,
-      });
-      await interaction.reply({
-        content: `Cleared ${clearedWarnings} warning${clearedWarnings === 1 ? "" : "s"} from ${user.tag}.`,
-        allowedMentions: { parse: [] },
-      });
-      return;
-    }
-
-    if (interaction.commandName === "purge") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      if (!interaction.channel?.isTextBased() || !("bulkDelete" in interaction.channel)) {
-        await interaction.reply({
-          content: "I can only purge messages in text channels where bulk delete is supported.",
-          ephemeral: true,
-        });
-        return;
-      }
-
-      const amount = interaction.options.getInteger("amount", true);
-      const reason = interaction.options.getString("reason");
-
-      await interaction.deferReply({ ephemeral: true });
-      const deleted = await interaction.channel.bulkDelete(amount, true);
-      await sendPurgeAuditLog(interaction, {
-        requestedCount: amount,
-        deletedCount: deleted.size,
-        reason,
-      });
-      await interaction.editReply(
-        `Purged ${deleted.size} message${deleted.size === 1 ? "" : "s"}. Messages older than 14 days are skipped by Discord.`
-      );
-      return;
-    }
-
-    if (interaction.commandName === "slowmode") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      if (!interaction.channel || !("setRateLimitPerUser" in interaction.channel)) {
-        await interaction.reply({
-          content: "I can only set slowmode in channels that support it.",
-          ephemeral: true,
-        });
-        return;
-      }
-
-      const seconds = interaction.options.getInteger("seconds", true);
-      const reason = interaction.options.getString("reason");
-
-      await interaction.channel.setRateLimitPerUser(seconds, formatReason(interaction, reason));
-      await sendSlowmodeAuditLog(interaction, { seconds, reason });
-      await interaction.reply({
-        content: seconds === 0
-          ? "Slowmode is now off in this channel."
-          : `Slowmode is now ${seconds} second${seconds === 1 ? "" : "s"} in this channel.`,
-        ephemeral: true,
-      });
-      return;
-    }
-
-    if (interaction.commandName === "lock") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      if (!interaction.channel || !("permissionOverwrites" in interaction.channel)) {
-        await interaction.reply({
-          content: "I can only lock channels that support permission overwrites.",
-          ephemeral: true,
-        });
-        return;
-      }
-
-      const reason = interaction.options.getString("reason");
-      await interaction.channel.permissionOverwrites.edit(
-        interaction.guild.roles.everyone,
-        { SendMessages: false },
-        { reason: formatReason(interaction, reason) }
-      );
-      await sendChannelLockAuditLog(interaction, { action: "Lock", reason });
-      await interaction.reply({ content: "This channel is now locked.", ephemeral: true });
-      return;
-    }
-
-    if (interaction.commandName === "unlock") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      if (!interaction.channel || !("permissionOverwrites" in interaction.channel)) {
-        await interaction.reply({
-          content: "I can only unlock channels that support permission overwrites.",
-          ephemeral: true,
-        });
-        return;
-      }
-
-      const reason = interaction.options.getString("reason");
-      await interaction.channel.permissionOverwrites.edit(
-        interaction.guild.roles.everyone,
-        { SendMessages: null },
-        { reason: formatReason(interaction, reason) }
-      );
-      await sendChannelLockAuditLog(interaction, { action: "Unlock", reason });
-      await interaction.reply({ content: "This channel is now unlocked.", ephemeral: true });
-      return;
-    }
-
-    if (interaction.commandName === "kick") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      const { user, member } = await getTargetMember(interaction);
-
-      if (!member) {
-        await interaction.reply({ content: "I could not find that member in this server.", ephemeral: true });
-        return;
-      }
-
-      if (isSelfAction(interaction, user)) {
-        await interaction.reply({ content: "That action is not allowed for this user.", ephemeral: true });
-        return;
-      }
-
-      if (!member.kickable) {
-        await interaction.reply({
-          content: "I cannot kick that member. Check my permissions and role position.",
-          ephemeral: true,
-        });
-        return;
-      }
-
-      const providedReason = interaction.options.getString("reason");
-      const reason = formatReason(interaction, providedReason);
-      await member.kick(reason);
-      await sendAuditLog(interaction, { action: "Kick", user, reason: providedReason });
-      await interaction.reply({ content: `Kicked ${user.tag}.`, allowedMentions: { parse: [] } });
-      return;
-    }
-
-    if (interaction.commandName === "ban") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      const { user, member } = await getTargetMember(interaction);
-
-      if (isSelfAction(interaction, user)) {
-        await interaction.reply({ content: "That action is not allowed for this user.", ephemeral: true });
-        return;
-      }
-
-      if (member && !member.bannable) {
-        await interaction.reply({
-          content: "I cannot ban that member. Check my permissions and role position.",
-          ephemeral: true,
-        });
-        return;
-      }
-
-      const providedReason = interaction.options.getString("reason");
-      const reason = formatReason(interaction, providedReason);
-      await interaction.guild.members.ban(user.id, { reason });
-      await sendAuditLog(interaction, { action: "Ban", user, reason: providedReason });
-      await interaction.reply({ content: `Banned ${user.tag}.`, allowedMentions: { parse: [] } });
-      return;
-    }
-
-    if (interaction.commandName === "timeout") {
-      if (!(await requireGuild(interaction))) {
-        return;
-      }
-
-      const { user, member } = await getTargetMember(interaction);
-      const minutes = interaction.options.getInteger("minutes", true);
-
-      if (!member) {
-        await interaction.reply({ content: "I could not find that member in this server.", ephemeral: true });
-        return;
-      }
-
-      if (isSelfAction(interaction, user)) {
-        await interaction.reply({ content: "That action is not allowed for this user.", ephemeral: true });
-        return;
-      }
-
-      if (!member.moderatable) {
-        await interaction.reply({
-          content: "I cannot timeout that member. Check my permissions and role position.",
-          ephemeral: true,
-        });
-        return;
-      }
-
-      const providedReason = interaction.options.getString("reason");
-      const reason = formatReason(interaction, providedReason);
-      await member.timeout(minutes * 60 * 1000, reason);
-      await sendAuditLog(interaction, {
-        action: "Timeout",
-        user,
-        reason: providedReason,
-        duration: `${minutes} minute${minutes === 1 ? "" : "s"}`,
-      });
-      await interaction.reply({
-        content: `Timed out ${user.tag} for ${minutes} minute${minutes === 1 ? "" : "s"}.`,
-        allowedMentions: { parse: [] },
-      });
-    }
-  } catch (error) {
-    console.error("Failed to handle interaction", error);
-
-    const message = "Something went wrong while running that command.";
-
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp({ content: message, ephemeral: true });
-    } else {
-      await interaction.reply({ content: message, ephemeral: true });
-    }
-  }
-});
-
-client.on(Events.Error, (error) => {
-  console.error("Discord client error", error);
-});
-
-process.on("unhandledRejection", (error) => {
-  console.error("Unhandled promise rejection", error);
-});
-
-try {
-  await client.login(token);
-} catch (error) {
-  if (error?.code === RESTJSONErrorCodes.InvalidToken) {
-    throw new Error("DISCORD_TOKEN is invalid. Check the bot token in your Discord Developer Portal.");
-  }
-
-  throw error;
+// Simple duration parser: 1d 2h 30m
+function parseDuration(str) {
+  if (!str) return 0;
+  const match = str.match(/(?:(\d+)d)?(?:(\d+)h)?(?:(\d+)m)?/);
+  if (!match) return 0;
+  const days = parseInt(match[1]||0, 10);
+  const hours = parseInt(match[2]||0, 10);
+  const mins = parseInt(match[3]||0, 10);
+  return ((days*24 + hours)*60 + mins) * 60 * 1000;
 }
+
+client.login(TOKEN);
